@@ -126,6 +126,12 @@ COLUMNS = [
     "升迁_省委书记",
     "本省提拔",
     "本省学习",
+    # 对照列（决策7）：code 派生标签为主列；过渡期保留 LLM 原值并存，便于审计/回退。
+    # Phase 3 真实数据对照验证后再决定去留（见 plan §7 / §10-Q4）。
+    "升迁_省长_llm",
+    "升迁_省委书记_llm",
+    "本省提拔_llm",
+    "本省学习_llm",
     "judge4con",      # confidence + reason for step4 label/bio judges
     # --- Per-row ---
     "经历序号",

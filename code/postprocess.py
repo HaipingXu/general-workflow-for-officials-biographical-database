@@ -33,6 +33,7 @@ from tenure import (
     is_prov_secretary_row,
     _strip_admin_suffix,
 )
+from derive_labels import derive_person_labels
 from utils import normalize_org_name, load_json_cache
 
 logger = logging.getLogger(__name__)
@@ -257,12 +258,40 @@ def flatten_person(
                 return step4_data.get(field, -1)
         return step4_data.get(field, -1)
 
-    promoted_mayor: Any = _get_label("升迁_省长")
-    promoted_sec: Any = _get_label("升迁_省委书记")
-    prov_promoted: Any = _get_label("本省提拔")
-    prov_study: Any = _get_label("本省学习")
+    # --- step4 派生标签：双轨（Phase 2，plan §7）---
+    # LLM 原值保留作对照列（决策7）；省级口径下 code 派生为主列，分歧记入 judge4con。
+    llm_promoted_mayor: Any = _get_label("升迁_省长")
+    llm_promoted_sec: Any = _get_label("升迁_省委书记")
+    llm_prov_promoted: Any = _get_label("本省提拔")
+    llm_prov_study: Any = _get_label("本省学习")
 
     _prov_mode = _is_province_mode(city)
+
+    label_divergence = ""
+    if _prov_mode:
+        # code 派生依赖 governor/secretary 谓词（省级口径）；市级暂沿用 LLM。
+        # departure（离任去向）为 Phase 5 才接入的 LLM 字段，此处先传空。
+        _code_labels = derive_person_labels(episodes, city, rank_map)
+        promoted_mayor: Any = _code_labels["升迁_省长"]
+        promoted_sec: Any = _code_labels["升迁_省委书记"]
+        prov_promoted: Any = _code_labels["本省提拔"]
+        prov_study: Any = _code_labels["本省学习"]
+        _diffs = [
+            f"{fld}:code={cv}/llm={lv}"
+            for fld, cv, lv in (
+                ("升迁_省长", promoted_mayor, llm_promoted_mayor),
+                ("升迁_省委书记", promoted_sec, llm_promoted_sec),
+                ("本省提拔", prov_promoted, llm_prov_promoted),
+                ("本省学习", prov_study, llm_prov_study),
+            )
+            if str(cv) != str(lv)
+        ]
+        label_divergence = "；".join(_diffs)
+    else:
+        promoted_mayor = llm_promoted_mayor
+        promoted_sec = llm_promoted_sec
+        prov_promoted = llm_prov_promoted
+        prov_study = llm_prov_study
 
     if _prov_mode:
         row_is_mayor = [
@@ -351,6 +380,9 @@ def flatten_person(
         j2 = judge_buckets.get("judge2_per_row", {}).get(ep_idx, "")
         j3 = judge_buckets.get("judge3_per_row", {}).get(ep_idx, "")
         j4 = judge4_first_row if idx == 0 else ""
+        if idx == 0 and label_divergence:
+            _div = f"[code≠llm] {label_divergence}"
+            j4 = f"{j4} | {_div}" if j4 else _div
 
         row = {
             "年份":           focal_year,
@@ -366,6 +398,10 @@ def flatten_person(
             "升迁_省委书记":  promoted_sec,
             "本省提拔":       prov_promoted,
             "本省学习":       prov_study,
+            "升迁_省长_llm":     llm_promoted_mayor,
+            "升迁_省委书记_llm": llm_promoted_sec,
+            "本省提拔_llm":      llm_prov_promoted,
+            "本省学习_llm":      llm_prov_study,
             "judge4con":      j4,
             "经历序号":       ep_idx,
             "起始时间":       ep.get("起始时间", ""),
