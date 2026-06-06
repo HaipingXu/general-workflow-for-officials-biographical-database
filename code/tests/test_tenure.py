@@ -10,6 +10,10 @@ from tenure import (
     ordered_source_lines,
     running_cummax,
     source_line_rank_maps,
+    normalise_province,
+    normalise_city,
+    is_governor_row,
+    is_prov_secretary_row,
 )
 
 
@@ -109,6 +113,39 @@ def test_source_line_rank_maps_integration():
     assert sl_highest == {7: "", 5: "副部级"}          # study group → ""; 兼职 就高 → 副部级
     # chronological sl5(1998)→副部级, sl7(2001, 无)→cummax 保持 副部级（不降）
     assert sl_cummax == {5: "副部级", 7: "副部级"}
+
+
+# ── place normalisation + office predicates (moved from postprocess) ─────────
+
+def test_normalise_province_adds_suffix():
+    assert normalise_province("浙江") == "浙江省"
+    assert normalise_province("浙江省") == "浙江省"
+    assert normalise_province("") == ""
+
+
+def test_normalise_city_keeps_suffix():
+    assert normalise_city("杭州市") == "杭州市"
+    assert normalise_city("") == ""
+
+
+def test_is_governor_row_includes_acting():
+    # 代省长 counts as 省长 (governor) — C5 prerequisite
+    assert is_governor_row("代省长", "浙江省人民政府", "浙江", "浙江") == 1
+    assert is_governor_row("省长", "浙江省人民政府", "浙江", "浙江") == 1
+
+
+def test_is_governor_row_excludes_deputy_and_assistant():
+    assert is_governor_row("副省长", "浙江省人民政府", "浙江", "浙江") == 0
+    assert is_governor_row("省长助理", "浙江省人民政府", "浙江", "浙江") == 0
+
+
+def test_is_governor_row_wrong_province():
+    assert is_governor_row("省长", "江苏省人民政府", "江苏", "浙江") == 0
+
+
+def test_is_prov_secretary_row_basic():
+    assert is_prov_secretary_row("省委书记", "中共浙江省委", "浙江", "浙江") == 1
+    assert is_prov_secretary_row("省委副书记", "中共浙江省委", "浙江", "浙江") == 0
 
 
 # Allow running without pytest installed.
