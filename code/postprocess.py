@@ -424,7 +424,7 @@ def flatten_person(
     }
 
     # Ordered source lines by start time for running cummax computation
-    # (最终行政级别 = running maximum — only increases, never decreases)
+    # (本时期行政级别 = running maximum — only increases, never decreases)
     _sl_order: list[tuple[int, int, str]] = []  # (sort_key, sl, rank)
     for idx_tmp, ep_tmp in enumerate(episodes):
         sl = ep_tmp.get("source_line", idx_tmp + 1)
@@ -521,7 +521,7 @@ def flatten_person(
             "中央/地方":      ep.get("中央/地方", ""),
             "judge2con":      j2,
             "该条行政级别":   per_rank,
-            "最终行政级别":   highest_rank if highest_rank else per_rank,
+            "本时期行政级别":   highest_rank if highest_rank else per_rank,
             "judge3con":      j3,
             "原文引用":       _build_source_ref(ep, idx, career_lines_map),
             "是否落马":       is_fell,
