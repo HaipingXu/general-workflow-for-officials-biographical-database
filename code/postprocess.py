@@ -18,144 +18,31 @@ from typing import Any
 from config import (
     LOGS_DIR,
     ORG_TAGS,
-    PROVINCE_NORMALIZE,
-    CITY_NORMALIZE,
     COLUMNS,
-    DIRECT_MUNICIPALITIES,
     PROVINCE_NAMES,
     POSITION_TAGS,
-    get_highest_rank,
 )
 from text_preprocessor import preprocess_official
+from tenure import (
+    source_line_rank_maps,
+    normalise_province,
+    normalise_city,
+    is_mayor_row,
+    is_secretary_row,
+    is_governor_row,
+    is_prov_secretary_row,
+    _strip_admin_suffix,
+)
+from derive_labels import derive_person_labels
 from utils import normalize_org_name, load_json_cache
 
 logger = logging.getLogger(__name__)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ── Place-name normalisation ───────────────────────────────────────────────────
-
-def normalise_province(raw: str) -> str:
-    if not raw:
-        return ""
-    raw = raw.strip()
-    if raw in PROVINCE_NORMALIZE.values():
-        return raw
-    if raw in PROVINCE_NORMALIZE:
-        return PROVINCE_NORMALIZE[raw]
-    for short, full in PROVINCE_NORMALIZE.items():
-        if raw.startswith(short) or full.startswith(raw):
-            return full
-    return raw
-
-
-def normalise_city(raw: str) -> str:
-    if not raw:
-        return ""
-    raw = raw.strip()
-    if re.search(r"[市区县州盟]$", raw):
-        return raw
-    if raw in CITY_NORMALIZE:
-        return CITY_NORMALIZE[raw]
-    for short, full in CITY_NORMALIZE.items():
-        if raw.startswith(short):
-            return full
-    return raw
-
-
-# ── Row-level flag helpers ─────────────────────────────────────────────────────
-
-def _strip_admin_suffix(name: str) -> str:
-    name = re.sub(r"(壮族|回族|维吾尔)?自治区$", "", name)
-    name = re.sub(r"特别行政区$", "", name)
-    name = re.sub(r"省$", "", name)
-    # 仅删直辖市的"市"后缀；不可删"州/盟"（否则"贵州"→"贵"导致省份匹配失败）
-    return re.sub(r"市$", "", name)
-
-
-def _match_position(
-    position: str, unit: str, location: str, target: str,
-    *, role: str,
-) -> int:
-    if not position:
-        return 0
-    target_short = _strip_admin_suffix(target)
-    context = (unit or "") + (location or "")
-    if context and target_short not in context:
-        return 0
-    is_municipality = target_short in DIRECT_MUNICIPALITIES
-
-    if role == "governor":
-        if "副省长" in position or "副主席" in position or "常务副" in position:
-            return 0
-        if "助理" in position:  # 省长助理/主席助理 ≠ 行政首长
-            return 0
-        if re.search(r"(^|[\s、，,])(?:代)?省长(?!助理)", position):
-            return 1
-        if re.search(r"(^|[\s、，,])(?:代)?主席", position):
-            ctx = (unit or "") + position
-            # 排除群团/议事机构的"主席"（仅自治区政府主席才算行政首长）
-            non_gov = ("政协", "人大", "工会", "妇联", "残联", "侨联",
-                       "文联", "科协", "工商联", "红十字", "贸促",
-                       "作协", "记协", "青联", "学联")
-            if any(k in ctx for k in non_gov):
-                return 0
-            return 1
-        if is_municipality:
-            if "副市长" not in position and re.search(r"(^|[\s、，,])(?:代)?市长", position):
-                return 1
-    elif role == "secretary":
-        if "副书记" in position:
-            return 0
-        if re.search(r"(^|[\s、，,])省委书记", position):
-            return 1
-        if re.search(r"(^|[\s、，,])自治区党委书记", position):
-            return 1
-        if is_municipality and re.search(r"(^|[\s、，,])市委书记", position):
-            return 1
-        if re.search(r"(^|[\s、，,])书记$", position):
-            u = unit or ""
-            # 群团/议事/纪检等含"委"但非党委的机构，一律排除
-            bad_org = any(k in u for k in ("共青团", "团委", "纪委", "政法委",
-                                            "工会", "妇联", "政协", "人大"))
-            # 省级党委正名：中共XX省委 / 中共XX自治区委(员会) / XX自治区党委
-            # 不可用"区委$"兜底（会误匹配县辖"华溪区委/城郊区委"）
-            is_prov_party = (
-                bool(re.search(r"中共.*省委(员会)?$", u))
-                or "自治区党委" in u
-                or bool(re.search(r"中共.*自治区委(员会)?$", u))
-            )
-            if is_prov_party and not bad_org:
-                return 1
-            # 直辖市党委：中共北京/上海/天津/重庆市委
-            if is_municipality and re.search(r"中共.*市委(员会)?$", u) and not bad_org:
-                return 1
-    elif role == "mayor":
-        if "副市长" in position or "常务副" in position:
-            return 0
-        if re.search(r"(^|[\s、，,])(?:代)?市长", position):
-            return 1
-    elif role == "city_secretary":
-        if "副书记" in position or "副市委" in position:
-            return 0
-        if re.search(r"(^|[\s、，,])市委书记", position):
-            return 1
-        if re.search(r"(^|[\s、，,])书记$", position) and "市委" in (unit or ""):
-            return 1
-    return 0
-
-
-def is_mayor_row(position, unit, location_city, target_city):
-    return _match_position(position, unit, location_city, target_city, role="mayor")
-
-def is_secretary_row(position, unit, location_city, target_city):
-    return _match_position(position, unit, location_city, target_city, role="city_secretary")
-
-def is_governor_row(position, unit, location_prov, target_province):
-    return _match_position(position, unit, location_prov, target_province, role="governor")
-
-def is_prov_secretary_row(position, unit, location_prov, target_province):
-    return _match_position(position, unit, location_prov, target_province, role="secretary")
+# ── Place-name normalisation + single-row office predicates ─────────────────────
+# Moved to tenure.py (PR2/PR3) so derive_labels reuses them without importing
+# postprocess (which would cycle). Re-imported above; behaviour unchanged.
 
 
 def _is_province_mode(city: str) -> bool:
@@ -371,12 +258,40 @@ def flatten_person(
                 return step4_data.get(field, -1)
         return step4_data.get(field, -1)
 
-    promoted_mayor: Any = _get_label("升迁_省长")
-    promoted_sec: Any = _get_label("升迁_省委书记")
-    prov_promoted: Any = _get_label("本省提拔")
-    prov_study: Any = _get_label("本省学习")
+    # --- step4 派生标签：双轨（Phase 2，plan §7）---
+    # LLM 原值保留作对照列（决策7）；省级口径下 code 派生为主列，分歧记入 judge4con。
+    llm_promoted_mayor: Any = _get_label("升迁_省长")
+    llm_promoted_sec: Any = _get_label("升迁_省委书记")
+    llm_prov_promoted: Any = _get_label("本省提拔")
+    llm_prov_study: Any = _get_label("本省学习")
 
     _prov_mode = _is_province_mode(city)
+
+    label_divergence = ""
+    if _prov_mode:
+        # code 派生依赖 governor/secretary 谓词（省级口径）；市级暂沿用 LLM。
+        # departure（离任去向）为 Phase 5 才接入的 LLM 字段，此处先传空。
+        _code_labels = derive_person_labels(episodes, city, rank_map)
+        promoted_mayor: Any = _code_labels["升迁_省长"]
+        promoted_sec: Any = _code_labels["升迁_省委书记"]
+        prov_promoted: Any = _code_labels["本省提拔"]
+        prov_study: Any = _code_labels["本省学习"]
+        _diffs = [
+            f"{fld}:code={cv}/llm={lv}"
+            for fld, cv, lv in (
+                ("升迁_省长", promoted_mayor, llm_promoted_mayor),
+                ("升迁_省委书记", promoted_sec, llm_promoted_sec),
+                ("本省提拔", prov_promoted, llm_prov_promoted),
+                ("本省学习", prov_study, llm_prov_study),
+            )
+            if str(cv) != str(lv)
+        ]
+        label_divergence = "；".join(_diffs)
+    else:
+        promoted_mayor = llm_promoted_mayor
+        promoted_sec = llm_promoted_sec
+        prov_promoted = llm_prov_promoted
+        prov_study = llm_prov_study
 
     if _prov_mode:
         row_is_mayor = [
@@ -413,38 +328,11 @@ def flatten_person(
     if rank_map is None:
         rank_map = {}
 
-    # Per source_line: highest concurrent rank (handles split episodes from same line)
-    sl_rank_groups: dict[int, list[str]] = {}
-    for idx_tmp, ep_tmp in enumerate(episodes):
-        sl = ep_tmp.get("source_line", idx_tmp + 1)
-        rank_val = ep_tmp.get("行政级别") or rank_map.get(idx_tmp + 1, "")
-        sl_rank_groups.setdefault(sl, []).append(rank_val)
-    sl_highest_rank: dict[int, str] = {
-        sl: get_highest_rank(ranks) for sl, ranks in sl_rank_groups.items()
-    }
-
-    # Ordered source lines by start time for running cummax computation
-    # (本时期行政级别 = running maximum — only increases, never decreases)
-    _sl_order: list[tuple[int, int, str]] = []  # (sort_key, sl, rank)
-    for idx_tmp, ep_tmp in enumerate(episodes):
-        sl = ep_tmp.get("source_line", idx_tmp + 1)
-        start = ep_tmp.get("起始时间", "") or ""
-        _year = int(start[:4]) if len(start) >= 4 and start[:4].isdigit() else 9999
-        _month = int(start[5:7]) if len(start) >= 7 and start[5:7].isdigit() else 0
-        _sl_order.append((_year * 100 + _month, sl, sl_highest_rank.get(sl, "")))
-    # Deduplicate by sl, keep first occurrence order
-    seen_sl: set[int] = set()
-    _ordered_sl: list[tuple[int, str]] = []
-    for _, sl, rank in sorted(_sl_order):
-        if sl not in seen_sl:
-            seen_sl.add(sl)
-            _ordered_sl.append((sl, rank))
-    # Build per-sl running cummax
-    sl_cummax: dict[int, str] = {}
-    _best_so_far: str = ""
-    for sl, rank in _ordered_sl:
-        _best_so_far = get_highest_rank([_best_so_far, rank]) if _best_so_far else rank
-        sl_cummax[sl] = _best_so_far
+    # Per source_line grouping + running cummax (本时期行政级别), extracted to
+    # tenure.py so derive_labels reuses the exact same 兼职 就高不就低 grouping.
+    #   sl_highest_rank[sl] = 组内最高级别（同期兼职就高不就低）
+    #   sl_cummax[sl]       = 截至该 source_line 的 running max（本时期行政级别，不降）
+    sl_highest_rank, sl_cummax = source_line_rank_maps(episodes, rank_map)
 
     # judge4 confidence goes to first row only
     judge4_first_row = judge_buckets.get("judge4_person", "")
@@ -492,6 +380,9 @@ def flatten_person(
         j2 = judge_buckets.get("judge2_per_row", {}).get(ep_idx, "")
         j3 = judge_buckets.get("judge3_per_row", {}).get(ep_idx, "")
         j4 = judge4_first_row if idx == 0 else ""
+        if idx == 0 and label_divergence:
+            _div = f"[code≠llm] {label_divergence}"
+            j4 = f"{j4} | {_div}" if j4 else _div
 
         row = {
             "年份":           focal_year,
@@ -507,6 +398,10 @@ def flatten_person(
             "升迁_省委书记":  promoted_sec,
             "本省提拔":       prov_promoted,
             "本省学习":       prov_study,
+            "升迁_省长_llm":     llm_promoted_mayor,
+            "升迁_省委书记_llm": llm_promoted_sec,
+            "本省提拔_llm":      llm_prov_promoted,
+            "本省学习_llm":      llm_prov_study,
             "judge4con":      j4,
             "经历序号":       ep_idx,
             "起始时间":       ep.get("起始时间", ""),
