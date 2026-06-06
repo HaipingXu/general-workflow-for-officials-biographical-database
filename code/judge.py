@@ -1,0 +1,1187 @@
+"""
+Judge module (v9): LLM arbitration for 4 pipeline stages.
+
+Stages:
+  judge_step1 — sl_group + step1 ep_batch (起止时间/供职单位/职务) → merged_episodes_step1.json
+  judge_step2 — classify (组织标签/标志位/任职地/中央地方)             → merged_episodes.json
+  judge_step3 — rank
+  judge_step4 — bio + label + corruption
+
+Battle export:
+  build_battles(logs_dir, output_dir, province) → battle1.xlsx … battle4.xlsx
+"""
+
+import json
+import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Callable
+
+import pandas as pd
+from openpyxl.styles import PatternFill, Font
+from openpyxl.utils import get_column_letter
+
+from config import (
+    LOGS_DIR, OUTPUT_DIR,
+    DEFAULT_WORKERS, JUDGE_MAX_RETRIES,
+    STEP1_EPISODE_FIELDS, STEP2_EPISODE_FIELDS,
+    JUDGE_FALLBACK_MODELS,
+    GEMINI_FALLBACK_BASE_URL, GEMINI_FALLBACK_API_KEYS, GEMINI_FALLBACK_API_KEY,
+)
+from failures import FAILURES
+from utils import (
+    extract_json, load_prompt, llm_chat,
+    RoundRobinClientPool, LLMConfig,
+    load_json_cache, save_json_cache,
+)
+
+logger = logging.getLogger(__name__)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ── Judge reference prompts ─────────────────────────────────────────────────
+
+def _load_judge_references() -> str:
+    parts: list[str] = []
+    for prompt_name, title in [
+        ("step1_extraction", "Step 1 字段提取规则（起止时间/供职单位/职务）"),
+        ("step2_classify",   "Step 2 分类规则（组织标签/标志位/任职地/中央地方）"),
+        ("step3_rank",       "Step 3 行政级别判断规则（10级 + 难以判断）"),
+        ("step4_labeling",   "Step 4 标签规则（升迁_省长/升迁_省委书记/本省提拔/本省学习/落马）"),
+    ]:
+        try:
+            content = load_prompt(prompt_name)
+            parts.append(f"\n\n---\n\n## 裁判参考：{title}\n\n{content}")
+        except Exception as e:
+            logger.warning(f"[judge] 无法加载参考 prompt {prompt_name}: {e}")
+    return "".join(parts)
+
+
+_JUDGE_REFERENCE: str | None = None
+
+
+def _get_judge_reference() -> str:
+    global _JUDGE_REFERENCE
+    if _JUDGE_REFERENCE is None:
+        _JUDGE_REFERENCE = _load_judge_references()
+    return _JUDGE_REFERENCE
+
+
+# ── Judge preambles ─────────────────────────────────────────────────────────
+
+_JUDGE_PREAMBLE = (
+    "你是一名中国政治数据核查专家，根据原文对两个LLM提取结果做裁判。\n\n"
+    "核心规则：\n"
+    "1. 学习经历（本科、研究生、博士、进修、培训等）也是条目。\n"
+    "2. 如果两方都不完全正确，你可以给出自己根据原文判断的正确值（verdict=自行修正）。\n"
+    "3. 党委系统供职单位必须使用全称带「中共」前缀（如「中共深圳市委」而非「深圳市委」）。\n"
+    "4. 除党委命名规则外，其他字段忠实于百度百科原文用词。\n"
+    "5. 【必须给出判断】无论两个LLM是否都不可靠，裁判必须给出自己的最佳判断。\n"
+    "   不允许以「两方都不确定」为由回避裁决——用 verdict=自行修正 + 低 confidence 表达不确定性。\n\n"
+    "输出JSON格式：\n"
+    "{\"verdict\": \"采纳LLM1\"|\"采纳LLM2\"|\"自行修正\", "
+    "\"correct_value\": \"仅当verdict=自行修正时填写（必填）\", "
+    "\"confidence\": 0-100, "
+    "\"reason\": \"<50字理由>\"}\n"
+    "confidence 表示对该裁决的信心（0=极度不确定仍给最优猜测，100=完全确定）。\n"
+)
+
+_JUDGE_SYSTEM_BASE = (
+    _JUDGE_PREAMBLE +
+    "\n如果一次裁判多个字段，输出JSON对象，key为字段名，value为上述格式：\n"
+    "{\"字段A\": {\"verdict\": ..., \"confidence\": 85, \"reason\": ...}, \"字段B\": {...}}\n\n"
+    "只输出JSON，无任何其他文字。"
+)
+
+_JUDGE_SYSTEM_LABEL_BASE = _JUDGE_PREAMBLE + "不要输出任何其他文字、解释或代码块标记。"
+
+_JUDGE_SYSTEM_RANK_BASE = (
+    "你是一名中国政治数据核查专家，判断行政级别。\n\n"
+    "两个LLM对同一职务判断了不同的行政级别，请根据职务和单位判断哪个更准确。\n"
+    "必须给出判断，不允许回避——若两者都错且原文信息不足（如早期\"干部\"/\"秘书\"等），\n"
+    "用 verdict=自行修正 + correct_value=\"难以判断\" + 低 confidence 表达不确定性。\n\n"
+    "输出JSON格式：\n"
+    "{\"verdict\": \"采纳LLM1\"|\"采纳LLM2\"|\"自行修正\", "
+    "\"correct_value\": \"仅当verdict=自行修正时填写（合法值含 难以判断）\", "
+    "\"confidence\": 0-100, "
+    "\"reason\": \"<50字理由>\"}\n"
+    "只输出JSON，无任何其他文字。"
+)
+
+_JUDGE_SYSTEM_CLASSIFY_BASE = (
+    _JUDGE_PREAMBLE +
+    "【组织标签字段】correct_value 必须从33个标准标签中选；"
+    "【标志位字段】correct_value 必须从24个标准标志位中选；"
+    "【任职地（省）】用完整正式名（如'广东省'非'广东'）。\n\n"
+    "如果一次裁判多个字段，输出JSON对象，key为字段名，value含 verdict/correct_value/confidence/reason。\n"
+    "只输出JSON，无任何其他文字。"
+)
+
+# ── ep_batch 专用：含「需拆分」verdict + 字段级分隔符规则 ────────────────────
+
+_JUDGE_SYSTEM_EP_BATCH_BASE = (
+    "你是一名中国政治数据核查专家，根据原文对两个LLM提取结果做字段级裁判。\n\n"
+    "核心规则：\n"
+    "1. 学习经历（本科、研究生、博士、进修、培训等）也是条目。\n"
+    "2. 如果两方都不完全正确，你可以给出自己根据原文判断的正确值（verdict=自行修正）。\n"
+    "3. 党委系统供职单位必须使用全称带「中共」前缀（如「中共深圳市委」而非「深圳市委」）。\n"
+    "4. 除党委命名规则外，其他字段忠实于百度百科原文用词。\n\n"
+    "⚠️ 供职单位字段的特殊规则（最重要）：\n"
+    "如果原文一行实际包含多个不同机构（如'任X省委副书记、Y市委书记'），\n"
+    "不要把多个机构名称塞进 correct_value——直接输出 {\"verdict\": \"需拆分\"} 即可，\n"
+    "无需给出 correct_value 或具体episodes。后续有专门一轮让裁判看完整上下文再拆。\n\n"
+    "⚠️ correct_value 字段级约束：\n"
+    "| 字段 | 允许「、」| 允许「；」/「;」/「和」| 说明 |\n"
+    "|---|---|---|---|\n"
+    "| 供职单位 | ❌ 禁止 | ❌ 禁止 | 含任何分隔符 ⇒ 必须走 verdict=\"需拆分\" |\n"
+    "| 职务 | ✅ 允许 | ❌ 禁止 | 仅当同一供职单位内多个职务（如\"副书记、政法委书记\"）|\n"
+    "| 起始时间 | ❌ 禁止 | ❌ 禁止 | 单值 |\n"
+    "| 终止时间 | ❌ 禁止 | ❌ 禁止 | 单值 |\n\n"
+    "verdict 枚举值（全部合法值）：\n"
+    "  采纳LLM1 | 采纳LLM2 | 自行修正 | 需拆分\n"
+    "  「需拆分」只在供职单位字段需要分成多个机构时使用，其他字段不可用此值。\n"
+    "  【必须给出判断】不可回避裁决，不确定时用 自行修正 + 低 confidence。\n\n"
+    "如果一次裁判多个字段，输出JSON对象，key为字段名，value为：\n"
+    "{\"verdict\": \"...\", \"correct_value\": \"仅当verdict=自行修正时填写\", "
+    "\"confidence\": 0-100, \"reason\": \"<50字理由>\"}\n\n"
+    "只输出JSON，无任何其他文字。"
+)
+
+
+def _judge_system() -> str:
+    return _JUDGE_SYSTEM_BASE + _get_judge_reference()
+
+
+def _judge_system_episode_batch() -> str:
+    return _JUDGE_SYSTEM_EP_BATCH_BASE + _get_judge_reference()
+
+
+def _judge_system_classify() -> str:
+    return _JUDGE_SYSTEM_CLASSIFY_BASE + _get_judge_reference()
+
+
+def _judge_system_label() -> str:
+    return _JUDGE_SYSTEM_LABEL_BASE + _get_judge_reference()
+
+
+def _judge_system_rank() -> str:
+    return _JUDGE_SYSTEM_RANK_BASE + _get_judge_reference()
+
+
+# ── Cache key builders ──────────────────────────────────────────────────────
+
+def _ep_cache_key(name: str, row: dict) -> str:
+    return (
+        f"{name}||ep_batch"
+        f"||sl{row.get('source_line', '')}"
+        f"||{row.get('LLM1_供职单位', '')}"
+        f"||{row.get('LLM1_职务', '')}"
+        f"||{row.get('LLM1_起始时间', '')}"
+    )
+
+
+def _sl_group_cache_key(name: str, line_num: int) -> str:
+    return f"{name}||sl_group||{line_num}"
+
+
+def _classify_cache_key(name: str, ep_idx: int, field: str) -> str:
+    return f"{name}||classify||{ep_idx}||{field}"
+
+
+def _label_cache_key(name: str, field: str) -> str:
+    return f"{name}||label||{field}"
+
+
+def _rank_cache_key(name: str, episode_idx: int) -> str:
+    return f"{name}||rank||{episode_idx}"
+
+
+# ── Judge fallback pool (shared, lazy-init) ──────────────────────────────────
+
+_judge_fallback_pool_inst: RoundRobinClientPool | None = None
+
+
+def _get_judge_fallback_pool() -> RoundRobinClientPool:
+    """Shared BLTCY pool for judge safety-fallback (same endpoint as judge)."""
+    global _judge_fallback_pool_inst
+    if _judge_fallback_pool_inst is None:
+        keys = GEMINI_FALLBACK_API_KEYS or ([GEMINI_FALLBACK_API_KEY] if GEMINI_FALLBACK_API_KEY else [])
+        _judge_fallback_pool_inst = RoundRobinClientPool(keys, GEMINI_FALLBACK_BASE_URL)
+    return _judge_fallback_pool_inst
+
+
+# ── Core judge call ─────────────────────────────────────────────────────────
+
+def _call_judge(system: str, prompt: str, pool: RoundRobinClientPool | None = None, model: str = "") -> dict:
+    if not pool:
+        return {"verdict": "两者均存疑", "reason": "裁判调用失败: 未提供 pool", "judge_model": "error"}
+    try:
+        raw = llm_chat(
+            pool, model,
+            system=system, user=prompt,
+            temperature=0.0, max_retries=JUDGE_MAX_RETRIES, seed=None,
+            max_tokens=16384,
+            response_format={"type": "json_object"},
+            # Judge fallback cascade for content-moderation blocks
+            safety_fallback_pool=_get_judge_fallback_pool(),
+            safety_fallback_models=list(JUDGE_FALLBACK_MODELS),
+        )
+        result = extract_json(raw)
+        result["judge_model"] = model
+        return result
+    except Exception as e:
+        if "Content Exists Risk" in str(e):
+            FAILURES.record(
+                scope="judge", source="judge", step="call_judge",
+                name="(content-blocked)", error="内容安全拦截",
+                extra={"prompt_head": prompt[:120]},
+            )
+            return {"verdict": "两者均存疑", "reason": "内容安全拦截", "judge_model": "blocked"}
+        FAILURES.record(
+            scope="judge", source="judge", step="call_judge",
+            name="(call-failed)", error=e,
+        )
+        return {"verdict": "两者均存疑", "reason": f"裁判调用失败: {e}", "judge_model": "error"}
+
+
+# ── ep_batch schema validation ──────────────────────────────────────────────
+
+_INVALID_SEP_BY_FIELD: dict[str, tuple[str, ...]] = {
+    "供职单位": ("；", ";", "、", "和"),
+    "职务":    ("；", ";", "和"),
+    "起始时间": ("；", ";", "、"),
+    "终止时间": ("；", ";", "、"),
+}
+
+
+def _validate_field_decision(decision: dict, field: str, meta_key: str = "") -> dict:
+    """Normalize ep_batch field decision; auto-upgrade or downgrade schema violations.
+
+    Records a FAILURES entry for any downgraded decision so prompt compliance
+    can be monitored (target: downgrade rate < 5%).
+    """
+    verdict = decision.get("verdict", "")
+    cv = decision.get("correct_value", "")
+    invalid_seps = _INVALID_SEP_BY_FIELD.get(field, ())
+
+    if verdict in ("自行修正", "两者均存疑") and cv:
+        if "需拆分" in cv or "拆分提取" in cv:
+            logger.warning(f"[judge schema] field={field} correct_value含需拆分文字: {cv!r} → 转needsplit")
+            decision = dict(decision)
+            decision["verdict"] = "需拆分"
+            decision["correct_value"] = ""
+            decision["_downgraded"] = True
+            decision["_downgrade_reason"] = "natural_language_recovered_to_needsplit"
+            if meta_key:
+                decision["_meta_key"] = meta_key
+        elif any(sep in cv for sep in invalid_seps):
+            decision = dict(decision)
+            if field == "供职单位":
+                logger.warning(f"[judge schema] 供职单位含分隔符: {cv!r} → 转needsplit")
+                decision["verdict"] = "需拆分"
+                decision["correct_value"] = ""
+                decision["_downgraded"] = True
+                decision["_downgrade_reason"] = "multivalue_unit_recovered_to_needsplit"
+            else:
+                logger.warning(f"[judge schema] field={field} 含非法分隔符: {cv!r} → 降级")
+                decision["verdict"] = "两者均存疑"
+                decision["correct_value"] = ""
+                decision["_downgraded"] = True
+                decision["_downgrade_reason"] = f"invalid_separator_in_{field}"
+            if meta_key:
+                decision["_meta_key"] = meta_key
+
+    if decision.get("_downgraded"):
+        FAILURES.record(
+            scope="judge_schema", source="judge", step="step1_validate",
+            name=meta_key or decision.get("_meta_key", "?"),
+            error=decision.get("_downgrade_reason", "unknown"),
+        )
+    return decision
+
+
+# ── Step1 judge helpers ─────────────────────────────────────────────────────
+
+def judge_source_line_group(
+    name: str, line_num: int, raw_text: str,
+    ds_episodes: list[dict], vf_episodes: list[dict],
+    pool: RoundRobinClientPool | None = None, model: str = "",
+) -> dict:
+    all_fields = STEP1_EPISODE_FIELDS
+
+    def _fmt(eps):
+        lines = []
+        for i, ep in enumerate(eps, 1):
+            parts = [f"{f}={ep.get(f, '')}" for f in all_fields]
+            lines.append(f"  #{i}: " + ", ".join(parts))
+        return "\n".join(lines) if lines else "  （无）"
+
+    prompt = (
+        f"官员：{name}\n"
+        f"原文行 L{line_num:02d}: {raw_text}\n\n"
+        f"LLM1从此行提取了 {len(ds_episodes)} 条经历：\n{_fmt(ds_episodes)}\n\n"
+        f"LLM2从此行提取了 {len(vf_episodes)} 条经历：\n{_fmt(vf_episodes)}\n\n"
+        "两个LLM对这一行原文的拆分方式不同。请判断哪种更准确，并输出最终正确版本。\n\n"
+        "判断规则：\n"
+        "- 同一时间段在同一单位的多个职务 → 合并为一条（职务用顿号连接）\n"
+        "- 不同时间段或不同单位 → 拆分为多条\n"
+        "- 党组书记/党组成员与行政职务同期同单位 → 合并\n\n"
+        "本步骤只关心 step1 字段：起始时间/终止时间/供职单位/职务。\n"
+        "组织标签、标志位、任职地、级别等留给后续步骤，无需在此填写。\n\n"
+        f"输出JSON:\n"
+        f"{{\n"
+        f"  \"adopt\": \"LLM1\" 或 \"LLM2\",\n"
+        f"  \"confidence\": 0-100,\n"
+        f"  \"reason\": \"<50字理由>\",\n"
+        f"  \"episodes\": [\n"
+        f"    {{\"source_line\": {line_num}, \"起始时间\": \"YYYY.MM\", \"终止时间\": \"YYYY.MM\","
+        f" \"供职单位\": \"...\", \"职务\": \"...\"}}\n"
+        f"  ]\n"
+        f"}}\n"
+        f"只输出JSON，无任何其他文字。"
+    )
+    return _call_judge(_judge_system(), prompt, pool=pool, model=model)
+
+
+def judge_episode_batch(
+    name: str, disputed_fields: list[str],
+    llm1_values: dict[str, str], llm2_values: dict[str, str],
+    ref_llm1: str, ref_llm2: str,
+    pool: RoundRobinClientPool | None = None, model: str = "",
+) -> dict[str, dict]:
+    if not disputed_fields:
+        return {}
+
+    field_lines = []
+    for f in disputed_fields:
+        field_lines.append(f"  {f}: LLM1=「{llm1_values.get(f, '')}」 LLM2=「{llm2_values.get(f, '')}」")
+    fields_block = "\n".join(field_lines)
+
+    prompt = (
+        f"官员：{name}\n\n"
+        f"LLM1来源行：{ref_llm1 or '（无）'}\n"
+        f"LLM2来源行：{ref_llm2 or '（无）'}\n\n"
+        f"以下 {len(disputed_fields)} 个字段存在争议：\n{fields_block}\n\n"
+        "请对每个字段分别裁判。\n"
+        "输出JSON对象，key为字段名，value含verdict/reason/correct_value/confidence。"
+    )
+
+    result = _call_judge(_judge_system_episode_batch(), prompt, pool=pool, model=model)
+
+    parsed: dict[str, dict] = {}
+    if len(disputed_fields) == 1:
+        f = disputed_fields[0]
+        if "verdict" in result:
+            parsed[f] = result
+        elif f in result:
+            parsed[f] = result[f]
+        else:
+            parsed[f] = {"verdict": "两者均存疑", "reason": "解析失败"}
+    else:
+        for f in disputed_fields:
+            if f in result and isinstance(result[f], dict):
+                parsed[f] = result[f]
+            elif "verdict" in result:
+                parsed[f] = result
+            else:
+                parsed[f] = {"verdict": "两者均存疑", "reason": "批量裁判未覆盖此字段"}
+
+    model_tag = result.get("judge_model", model)
+    for f in parsed:
+        parsed[f]["judge_model"] = model_tag
+        parsed[f] = _validate_field_decision(parsed[f], f)
+
+    return parsed
+
+
+def get_judge_decision(
+    name: str, field: str, scope: str,
+    llm1_value: str, llm1_reason: str,
+    llm2_value: str, llm2_reason: str,
+    original_text_snippet: str,
+    province: str = "",
+    pool: RoundRobinClientPool | None = None, model: str = "",
+) -> dict:
+    province_line = f"目标省份：{province}\n" if province else ""
+    prompt = (
+        f"官员：{name}  字段：{field}（{scope}）\n"
+        f"{province_line}\n"
+        f"原文依据：{original_text_snippet or '（无）'}\n\n"
+        f"LLM1提取：{llm1_value}\n"
+        f"LLM1依据：{llm1_reason or '（无）'}\n\n"
+        f"LLM2提取：{llm2_value}\n"
+        f"LLM2依据：{llm2_reason or '（无）'}\n\n"
+        "根据原文和两方依据，判断哪个更准确。如果两方都不正确，请自行给出正确值。"
+    )
+    return _call_judge(_judge_system_label(), prompt, pool=pool, model=model)
+
+
+# ── Common concurrent judge executor ────────────────────────────────────────
+
+def _run_judge_tasks(
+    pending: list[tuple[str, dict]],
+    judge_fn: Callable[[str, dict], tuple[str, dict]],
+    cache: dict,
+    max_workers: int,
+    step_label: str = "judge",
+    model: str = "",
+) -> None:
+    if not pending:
+        return
+
+    if max_workers <= 1:
+        for ck, kw in pending:
+            try:
+                _, decision = judge_fn(ck, kw)
+                cache[ck] = decision
+            except Exception as e:
+                logger.error(f"[{step_label} error] {ck}: {e}")
+                FAILURES.record(
+                    scope="judge", source="judge", step=step_label,
+                    name=ck, error=e,
+                )
+                cache[ck] = {"verdict": "两者均存疑", "reason": f"异常: {e}", "judge_model": model}
+    else:
+        lock = threading.Lock()
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(judge_fn, ck, kw): ck for ck, kw in pending}
+            for fut in as_completed(futures):
+                try:
+                    ck, decision = fut.result()
+                    with lock:
+                        cache[ck] = decision
+                except Exception as e:
+                    ck = futures[fut]
+                    logger.error(f"[{step_label} error] {ck}: {e}")
+                    FAILURES.record(
+                        scope="judge", source="judge", step=step_label,
+                        name=ck, error=e,
+                    )
+                    with lock:
+                        cache[ck] = {"verdict": "两者均存疑", "reason": f"异常: {e}", "judge_model": model}
+
+
+# ── Phase C helper ──────────────────────────────────────────────────────────
+
+def _collect_need_split_from_epbatch(judge_cache: dict) -> set[tuple[str, int]]:
+    """Scan judge_cache for ep_batch entries with verdict='需拆分'; return (name, sl) set."""
+    need_split: set[tuple[str, int]] = set()
+    for key, decision in judge_cache.items():
+        parts = key.split("||")
+        # key format: name||ep_batch||slN||unit||pos||time||field
+        if len(parts) >= 3 and parts[1] == "ep_batch":
+            if decision.get("verdict") == "需拆分":
+                name = parts[0]
+                sl_str = parts[2]
+                if sl_str.startswith("sl"):
+                    try:
+                        need_split.add((name, int(sl_str[2:])))
+                    except ValueError:
+                        pass
+    return need_split
+
+
+# ── Judge Step 1 (basic episode fields + sl_group) ──────────────────────────
+
+def judge_step1(
+    logs_dir: Path,
+    officials_dir: Path | None = None,
+    force: bool = False,
+    max_workers: int = DEFAULT_WORKERS,
+    pool: RoundRobinClientPool | None = None,
+    model: str = "",
+) -> Path:
+    """Judge step1 disputes and produce merged_episodes_step1.json."""
+    from diff import group_by_source_line
+    from text_preprocessor import preprocess_official
+    from merged_builder import build_merged_episodes_step1
+
+    logger.info("=== Step1 Judge: episode 字段 + sl_group 裁判 ===")
+
+    diff_path = logs_dir / "step1_diff_report.json"
+    diff_report = json.loads(diff_path.read_text(encoding="utf-8"))
+
+    career_lines_by_name: dict[str, dict[int, str]] = {}
+    for person in diff_report:
+        oname = person.get("official_name", "")
+        if oname:
+            preprocessed = preprocess_official(oname, officials_dir=officials_dir)
+            if preprocessed and preprocessed.get("career_lines"):
+                career_lines_by_name[oname] = {
+                    cl["line_num"]: cl["raw_text"] for cl in preprocessed["career_lines"]
+                }
+
+    judge_cache_path = logs_dir / "step1_judge_decisions.json"
+    judge_cache: dict = {}
+    if judge_cache_path.exists() and not force:
+        try:
+            judge_cache = json.loads(judge_cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    sl_mismatch_data: dict[tuple[str, int], dict] = {}
+    pending_episode_calls: list[tuple[str, dict]] = []
+    pending_group_calls: list[tuple[str, dict]] = []
+
+    # Build lookup tables for Phase C reuse (same parse, different access pattern)
+    ds_groups_by_name: dict[str, dict[int, list[dict]]] = {}
+    vf_groups_by_name: dict[str, dict[int, list[dict]]] = {}
+
+    for person in diff_report:
+        name = person["official_name"]
+        ds_s1 = person.get("llm1_step1", {})
+        vf_s1 = person.get("llm2_step1", {})
+        eps_ds = ds_s1.get("episodes", [])
+        eps_vf = vf_s1.get("episodes", [])
+        cl_map = career_lines_by_name.get(name, {})
+
+        ds_groups = group_by_source_line(eps_ds)
+        vf_groups = group_by_source_line(eps_vf)
+        ds_groups_by_name[name] = ds_groups
+        vf_groups_by_name[name] = vf_groups
+        all_lines = sorted(set(ds_groups) | set(vf_groups))
+
+        for line_num in all_lines:
+            ds_list = ds_groups.get(line_num, [])
+            vf_list = vf_groups.get(line_num, [])
+
+            if len(ds_list) != len(vf_list):
+                sl_mismatch_data[(name, line_num)] = {
+                    "ds_episodes": ds_list, "vf_episodes": vf_list,
+                    "raw_text": cl_map.get(line_num, ""),
+                }
+                cache_key = _sl_group_cache_key(name, line_num)
+                if cache_key not in judge_cache:
+                    pending_group_calls.append((cache_key, {
+                        "name": name, "line_num": line_num,
+                        "raw_text": cl_map.get(line_num, ""),
+                        "ds_episodes": ds_list, "vf_episodes": vf_list,
+                    }))
+                continue
+
+            ds_sorted = sorted(ds_list, key=lambda e: e.get("供职单位", ""))
+            vf_sorted = sorted(vf_list, key=lambda e: e.get("供职单位", ""))
+
+            for i in range(min(len(ds_sorted), len(vf_sorted))):
+                ep_ds = ds_sorted[i]
+                ep_vf = vf_sorted[i]
+                disputed_fields = []
+                row = {"source_line": line_num}
+                for f in STEP1_EPISODE_FIELDS:
+                    v_ds = str(ep_ds.get(f, ""))
+                    v_vf = str(ep_vf.get(f, ""))
+                    row[f"LLM1_{f}"] = v_ds
+                    row[f"LLM2_{f}"] = v_vf
+                    if v_ds != v_vf:
+                        disputed_fields.append(f)
+
+                if not disputed_fields:
+                    continue
+
+                row["LLM1_供职单位"] = ep_ds.get("供职单位", "")
+                row["LLM1_职务"] = ep_ds.get("职务", "")
+                row["LLM1_起始时间"] = ep_ds.get("起始时间", "")
+                ep_key = _ep_cache_key(name, row)
+
+                all_cached = all(f"{ep_key}||{f}" in judge_cache for f in disputed_fields)
+                if not all_cached:
+                    llm1_vals = {f: str(row.get(f"LLM1_{f}", "")) for f in disputed_fields}
+                    llm2_vals = {f: str(row.get(f"LLM2_{f}", "")) for f in disputed_fields}
+                    sl_num = ep_ds.get("source_line", line_num)
+                    raw = cl_map.get(sl_num, "")
+                    pending_episode_calls.append((ep_key, {
+                        "name": name,
+                        "disputed_fields": disputed_fields,
+                        "llm1_values": llm1_vals,
+                        "llm2_values": llm2_vals,
+                        "ref_llm1": f"L{sl_num:02d}: {raw}" if raw else f"L{sl_num:02d}",
+                        "ref_llm2": "",
+                    }))
+
+    total_calls = len(pending_episode_calls) + len(pending_group_calls)
+
+    if total_calls > 0:
+        n_fields = sum(len(kw["disputed_fields"]) for _, kw in pending_episode_calls)
+        logger.info(f"  裁判调用: {len(pending_episode_calls)} 条履历({n_fields}个字段) + "
+                    f"{len(pending_group_calls)} 个分组 = {total_calls} 次")
+
+        ep_lock = threading.Lock()
+
+        def _judge_ep(ep_key: str, kwargs: dict) -> tuple[str, dict]:
+            result = judge_episode_batch(**kwargs, pool=pool, model=model)
+            with ep_lock:
+                for f, decision in result.items():
+                    judge_cache[f"{ep_key}||{f}"] = decision
+            return ep_key, result
+
+        def _judge_grp(cache_key: str, kwargs: dict) -> tuple[str, dict]:
+            decision = judge_source_line_group(**kwargs, pool=pool, model=model)
+            return cache_key, decision
+
+        # Phase A: sl 数量不一致的整段裁判
+        _run_judge_tasks(
+            pending_group_calls, _judge_grp, judge_cache,
+            max_workers, step_label="judge step1 group", model=model,
+        )
+        # Phase B: 字段级 ep_batch 裁判
+        _ep_dummy: dict = {}
+        _run_judge_tasks(
+            pending_episode_calls, _judge_ep, _ep_dummy,
+            max_workers, step_label="judge step1 ep", model=model,
+        )
+
+        # Phase C: ep_batch 判出「需拆分」的 sl 升级到 sl_group
+        need_split_sls = _collect_need_split_from_epbatch(judge_cache)
+        secondary_group_calls: list[tuple[str, dict]] = []
+        for (name, sl) in sorted(need_split_sls):
+            cache_key = _sl_group_cache_key(name, sl)
+            # 已被 Phase A 处理且未降级，跳过
+            if cache_key in judge_cache and not judge_cache[cache_key].get("_downgraded"):
+                continue
+            cl_map = career_lines_by_name.get(name, {})
+            secondary_group_calls.append((cache_key, {
+                "name": name,
+                "line_num": sl,
+                "raw_text": cl_map.get(sl, ""),
+                "ds_episodes": ds_groups_by_name.get(name, {}).get(sl, []),
+                "vf_episodes": vf_groups_by_name.get(name, {}).get(sl, []),
+            }))
+        if secondary_group_calls:
+            logger.info(f"  Phase C: ep_batch 升级到 sl_group 共 {len(secondary_group_calls)} 个 sl")
+            _run_judge_tasks(
+                secondary_group_calls, _judge_grp, judge_cache,
+                max_workers, step_label="judge step1 phase-c", model=model,
+            )
+
+    judge_cache_path.write_text(
+        json.dumps(judge_cache, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    # Build merged_episodes_step1.json (step1 fields only)
+    llm1_cache = load_json_cache(logs_dir / "llm1_step1_results.json")
+    llm2_cache = load_json_cache(logs_dir / "llm2_step1_results.json")
+
+    merged_all: dict[str, dict] = {}
+    for name, ds_item in llm1_cache.items():
+        vf_item = llm2_cache.get(name, {})
+        episodes = build_merged_episodes_step1(name, ds_item, vf_item, judge_cache)
+        merged_all[name] = {
+            "episodes": episodes,
+            "_meta": {"name": name, "source": "merged_step1"},
+        }
+
+    merged_path = logs_dir / "merged_episodes_step1.json"
+    save_json_cache(merged_path, merged_all)
+    logger.info(f"Step1 Judge 完成: {len(judge_cache)} 裁决, {len(merged_all)} 人 merged_episodes_step1")
+
+    return merged_path
+
+
+# ── Judge Step 2 (classification disputes) ──────────────────────────────────
+
+def judge_step2(
+    logs_dir: Path,
+    force: bool = False,
+    max_workers: int = DEFAULT_WORKERS,
+    pool: RoundRobinClientPool | None = None,
+    model: str = "",
+) -> Path:
+    """Judge step2 classification disputes; emit merged_episodes.json (full)."""
+    from merged_builder import build_merged_episodes_full
+
+    logger.info("=== Step2 Judge: classify 裁判 ===")
+
+    diff_path = logs_dir / "step2_diff_report.json"
+    diff_report = json.loads(diff_path.read_text(encoding="utf-8"))
+
+    judge_cache_path = logs_dir / "step2_judge_decisions.json"
+    judge_cache: dict = {}
+    if judge_cache_path.exists() and not force:
+        try:
+            judge_cache = json.loads(judge_cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    pending_calls: list[tuple[str, dict]] = []
+
+    # Group disputes per (name, ep_idx) to send all field disputes for an
+    # episode in a single judge call.
+    per_episode: dict[tuple[str, int], dict] = {}
+    for person in diff_report:
+        name = person["official_name"]
+        for d in person.get("diffs", []):
+            if d.get("scope") != "classify":
+                continue
+            ep_idx = d.get("episode_idx", 0)
+            slot = per_episode.setdefault((name, ep_idx), {
+                "name": name,
+                "ep_idx": ep_idx,
+                "供职单位": d.get("供职单位", ""),
+                "职务": d.get("职务", ""),
+                "起始时间": d.get("起始时间", ""),
+                "source_line": d.get("source_line", 0),
+                "fields": [],
+            })
+            slot["fields"].append({
+                "field": d["field"],
+                "llm1_value": d["llm1_value"],
+                "llm2_value": d["llm2_value"],
+            })
+
+    for (name, ep_idx), info in per_episode.items():
+        # Filter out fields that already have cached decisions
+        uncached_fields = [
+            f for f in info["fields"]
+            if _classify_cache_key(name, ep_idx, f["field"]) not in judge_cache
+        ]
+        if not uncached_fields:
+            continue
+        cache_key = f"__group__{name}__{ep_idx}"
+        pending_calls.append((cache_key, {
+            "name": name,
+            "ep_idx": ep_idx,
+            "info": info,
+            "uncached_fields": uncached_fields,
+        }))
+
+    if pending_calls:
+        logger.info(f"  step2 裁判调用: {len(pending_calls)} 个 episode 分组")
+
+        cls_lock = threading.Lock()
+
+        def _judge_cls(cache_key: str, kwargs: dict) -> tuple[str, dict]:
+            info = kwargs["info"]
+            ufields = kwargs["uncached_fields"]
+            field_lines = []
+            for f in ufields:
+                field_lines.append(
+                    f"  {f['field']}: LLM1=「{f['llm1_value']}」 LLM2=「{f['llm2_value']}」"
+                )
+            prompt = (
+                f"官员：{kwargs['name']}\n"
+                f"经历#{kwargs['ep_idx']} (L{info['source_line']:02d}): "
+                f"{info['供职单位']} | {info['职务']} | {info['起始时间']}\n\n"
+                f"以下 {len(ufields)} 个分类字段存在争议：\n"
+                + "\n".join(field_lines) + "\n\n"
+                "请对每个字段分别裁判。\n"
+                "输出JSON对象，key为字段名，value含 verdict/correct_value/confidence/reason。"
+            )
+            result = _call_judge(_judge_system_classify(), prompt, pool=pool, model=model)
+            # Normalize: result might be {field: {...}} or single-field flat
+            with cls_lock:
+                if len(ufields) == 1:
+                    f = ufields[0]["field"]
+                    if "verdict" in result:
+                        decision = {k: v for k, v in result.items() if k != "judge_model"}
+                        decision["judge_model"] = result.get("judge_model", model)
+                    elif f in result and isinstance(result[f], dict):
+                        decision = result[f]
+                        decision["judge_model"] = result.get("judge_model", model)
+                    else:
+                        decision = {"verdict": "两者均存疑", "reason": "解析失败",
+                                    "judge_model": model}
+                    judge_cache[_classify_cache_key(kwargs["name"], kwargs["ep_idx"], f)] = decision
+                else:
+                    for fobj in ufields:
+                        f = fobj["field"]
+                        if f in result and isinstance(result[f], dict):
+                            decision = result[f]
+                        elif "verdict" in result:
+                            decision = result
+                        else:
+                            decision = {"verdict": "两者均存疑", "reason": "未覆盖此字段"}
+                        decision = dict(decision)
+                        decision["judge_model"] = result.get("judge_model", model)
+                        judge_cache[_classify_cache_key(kwargs["name"], kwargs["ep_idx"], f)] = decision
+            return cache_key, result
+
+        _ep_dummy: dict = {}
+        _run_judge_tasks(
+            pending_calls, _judge_cls, _ep_dummy,
+            max_workers, step_label="judge step2", model=model,
+        )
+
+    judge_cache_path.write_text(
+        json.dumps(judge_cache, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    logger.info(f"Step2 Judge 完成: {len(judge_cache)} 裁决")
+
+    # Build merged_episodes.json (full, with step2 fields layered in)
+    merged_step1 = load_json_cache(logs_dir / "merged_episodes_step1.json")
+    llm1_cls = load_json_cache(logs_dir / "llm1_step2_classify.json")
+    llm2_cls = load_json_cache(logs_dir / "llm2_step2_classify.json")
+
+    merged_all: dict[str, dict] = {}
+    for name, m1 in merged_step1.items():
+        eps = build_merged_episodes_full(
+            name,
+            m1.get("episodes", []),
+            llm1_cls.get(name, {}),
+            llm2_cls.get(name, {}),
+            judge_cache,
+        )
+        merged_all[name] = {
+            "episodes": eps,
+            "_meta": {"name": name, "source": "merged_full"},
+        }
+
+    merged_path = logs_dir / "merged_episodes.json"
+    save_json_cache(merged_path, merged_all)
+    logger.info(f"  merged_episodes.json: {len(merged_all)} 人")
+
+    return judge_cache_path
+
+
+# ── Judge Step 3 (rank) ─────────────────────────────────────────────────────
+
+def judge_step3(
+    logs_dir: Path,
+    force: bool = False,
+    max_workers: int = DEFAULT_WORKERS,
+    pool: RoundRobinClientPool | None = None,
+    model: str = "",
+) -> Path:
+    """Judge step3 rank disputes. Saves step3_judge_decisions.json."""
+    logger.info("=== Step3 Judge: rank 裁判 ===")
+
+    diff_path = logs_dir / "step3_diff_report.json"
+    diff_report = json.loads(diff_path.read_text(encoding="utf-8"))
+
+    judge_cache_path = logs_dir / "step3_judge_decisions.json"
+    judge_cache: dict = {}
+    if judge_cache_path.exists() and not force:
+        try:
+            judge_cache = json.loads(judge_cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    pending_calls: list[tuple[str, dict]] = []
+
+    for person in diff_report:
+        name = person["official_name"]
+        for diff in person.get("diffs", []):
+            if diff.get("scope") != "rank":
+                continue
+            ep_idx = diff["episode_idx"]
+            cache_key = _rank_cache_key(name, ep_idx)
+            if cache_key not in judge_cache:
+                pending_calls.append((cache_key, {
+                    "name": name,
+                    "episode_idx": ep_idx,
+                    "unit": diff.get("供职单位", ""),
+                    "position": diff.get("职务", ""),
+                    "llm1_rank": diff["llm1_value"],
+                    "llm2_rank": diff["llm2_value"],
+                }))
+
+    if pending_calls:
+        logger.info(f"  裁判调用: {len(pending_calls)} 个 rank 争议")
+
+        def _judge_rank(cache_key: str, kwargs: dict) -> tuple[str, dict]:
+            prompt = (
+                f"官员：{kwargs['name']}\n"
+                f"经历#{kwargs['episode_idx']}: {kwargs['unit']} {kwargs['position']}\n\n"
+                f"LLM1判断级别：{kwargs['llm1_rank']}\n"
+                f"LLM2判断级别：{kwargs['llm2_rank']}\n\n"
+                "请判断哪个更准确。若信息不足以定级，可填 \"难以判断\"。"
+            )
+            decision = _call_judge(_judge_system_rank(), prompt, pool=pool, model=model)
+            return cache_key, decision
+
+        _run_judge_tasks(
+            pending_calls, _judge_rank, judge_cache,
+            max_workers, step_label="judge step3", model=model,
+        )
+
+    judge_cache_path.write_text(
+        json.dumps(judge_cache, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    logger.info(f"Step3 Judge 完成: {len(judge_cache)} 裁决")
+    return judge_cache_path
+
+
+# ── Judge Step 4 (label + bio + corruption) ─────────────────────────────────
+
+def judge_step4(
+    logs_dir: Path,
+    force: bool = False,
+    max_workers: int = DEFAULT_WORKERS,
+    pool: RoundRobinClientPool | None = None,
+    model: str = "",
+) -> Path:
+    """Judge step4 label/bio disputes. Saves step4_judge_decisions.json."""
+    logger.info("=== Step4 Judge: label + bio 裁判 ===")
+
+    diff_path = logs_dir / "step4_diff_report.json"
+    diff_report = json.loads(diff_path.read_text(encoding="utf-8"))
+
+    judge_cache_path = logs_dir / "step4_judge_decisions.json"
+    judge_cache: dict = {}
+    if judge_cache_path.exists() and not force:
+        try:
+            judge_cache = json.loads(judge_cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    pending_calls: list[tuple[str, dict]] = []
+
+    for person in diff_report:
+        name = person["official_name"]
+        # Extract target province from either LLM's _meta (available in label diffs)
+        province = (
+            person.get("llm1_step4", {}).get("_meta", {}).get("province", "")
+            or person.get("llm2_step4", {}).get("_meta", {}).get("province", "")
+        )
+        for diff in person.get("diffs", []):
+            scope = diff.get("scope", "")
+            field = diff.get("field", "")
+            cache_key = _label_cache_key(name, field)
+            if cache_key not in judge_cache:
+                if scope == "label":
+                    pending_calls.append((cache_key, {
+                        "name": name, "field": field, "scope": scope,
+                        "llm1_value": str(diff.get("llm1_value", "")),
+                        "llm1_reason": diff.get("ds_reason", ""),
+                        "llm2_value": str(diff.get("llm2_value", "")),
+                        "llm2_reason": diff.get("qw_reason", ""),
+                        "original_text_snippet": "",
+                        "province": province,
+                    }))
+                elif scope in ("bio", "corruption"):
+                    pending_calls.append((cache_key, {
+                        "name": name, "field": field, "scope": scope,
+                        "llm1_value": str(diff.get("llm1_value", "")),
+                        "llm1_reason": "",
+                        "llm2_value": str(diff.get("llm2_value", "")),
+                        "llm2_reason": "",
+                        "original_text_snippet": "",
+                        "province": province,
+                    }))
+
+    if pending_calls:
+        logger.info(f"  裁判调用: {len(pending_calls)} 个 label/bio 争议")
+
+        def _judge_lbl(cache_key: str, kwargs: dict) -> tuple[str, dict]:
+            decision = get_judge_decision(**kwargs, pool=pool, model=model)
+            return cache_key, decision
+
+        _run_judge_tasks(
+            pending_calls, _judge_lbl, judge_cache,
+            max_workers, step_label="judge step4", model=model,
+        )
+
+    judge_cache_path.write_text(
+        json.dumps(judge_cache, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    logger.info(f"Step4 Judge 完成: {len(judge_cache)} 裁决")
+    return judge_cache_path
+
+
+# ── Battle Excel export ─────────────────────────────────────────────────────
+
+FILL_RED = PatternFill(fill_type="solid", fgColor="FFCCCC")
+FILL_GREY = PatternFill(fill_type="solid", fgColor="E0E0E0")
+FILL_BLUE = PatternFill(fill_type="solid", fgColor="CCE5FF")
+FILL_PURPLE = PatternFill(fill_type="solid", fgColor="E8CCFF")
+FILL_GREEN = PatternFill(fill_type="solid", fgColor="CCFFCC")
+HEADER_FONT = Font(bold=True)
+
+
+def _auto_width(ws, cap=45):
+    for col in ws.columns:
+        max_len = max((len(str(c.value)) for c in col if c.value), default=6)
+        ws.column_dimensions[get_column_letter(col[0].column)].width = min(max_len + 2, cap)
+
+
+def _decision_view(decision: dict) -> dict:
+    """Flatten judge decision into common columns."""
+    return {
+        "verdict":        decision.get("verdict", ""),
+        "correct_value":  decision.get("correct_value", ""),
+        "confidence":     decision.get("confidence", ""),
+        "reason":         decision.get("reason", ""),
+        "judge_model":    decision.get("judge_model", ""),
+    }
+
+
+def _build_battle1(diff_report: list[dict], judge_cache: dict) -> pd.DataFrame:
+    """Step1 battle: each disputed (sl_group | ep_batch field) is one row."""
+    rows: list[dict] = []
+    for person in diff_report:
+        name = person["official_name"]
+        ds_eps = person.get("llm1_step1", {}).get("episodes", [])
+        vf_eps = person.get("llm2_step1", {}).get("episodes", [])
+        ds_by_sl: dict[int, list[dict]] = {}
+        vf_by_sl: dict[int, list[dict]] = {}
+        for ep in ds_eps:
+            ds_by_sl.setdefault(ep.get("source_line", 0), []).append(ep)
+        for ep in vf_eps:
+            vf_by_sl.setdefault(ep.get("source_line", 0), []).append(ep)
+
+        for d in person.get("diffs", []):
+            sl = d.get("source_line", 0)
+            scope = d.get("scope", "")
+            row = {
+                "姓名":     name,
+                "scope":    scope,
+                "字段":     d.get("field", ""),
+                "source_line": sl,
+                "供职单位":  d.get("供职单位", ""),
+                "LLM1值":   d.get("llm1_value", ""),
+                "LLM2值":   d.get("llm2_value", ""),
+                "level":    d.get("level", ""),
+            }
+            if scope == "episode_split" or scope == "episode_missing":
+                key = _sl_group_cache_key(name, sl)
+                decision = judge_cache.get(key, {})
+            else:
+                # try ep_batch field cache key
+                # use the ds ep with matching source_line+unit+pos to recover key
+                ds_match = next(
+                    (e for e in ds_by_sl.get(sl, [])
+                     if e.get("供职单位", "") == d.get("供职单位", "")),
+                    {}
+                )
+                ep_key = _ep_cache_key(name, {
+                    "source_line": sl,
+                    "LLM1_供职单位": ds_match.get("供职单位", d.get("供职单位", "")),
+                    "LLM1_职务":    ds_match.get("职务", ""),
+                    "LLM1_起始时间": ds_match.get("起始时间", ""),
+                })
+                decision = judge_cache.get(f"{ep_key}||{d.get('field','')}", {})
+            row.update(_decision_view(decision))
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def _build_battle2(diff_report: list[dict], judge_cache: dict) -> pd.DataFrame:
+    rows: list[dict] = []
+    for person in diff_report:
+        name = person["official_name"]
+        for d in person.get("diffs", []):
+            if d.get("scope") != "classify":
+                continue
+            ep_idx = d.get("episode_idx", 0)
+            field = d.get("field", "")
+            decision = judge_cache.get(_classify_cache_key(name, ep_idx, field), {})
+            row = {
+                "姓名": name,
+                "经历序号": ep_idx,
+                "source_line": d.get("source_line", 0),
+                "供职单位": d.get("供职单位", ""),
+                "职务":     d.get("职务", ""),
+                "字段":     field,
+                "LLM1值":   d.get("llm1_value", ""),
+                "LLM2值":   d.get("llm2_value", ""),
+                "level":    d.get("level", ""),
+            }
+            row.update(_decision_view(decision))
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _build_battle3(diff_report: list[dict], judge_cache: dict) -> pd.DataFrame:
+    rows: list[dict] = []
+    for person in diff_report:
+        name = person["official_name"]
+        for d in person.get("diffs", []):
+            ep_idx = d.get("episode_idx", 0)
+            decision = judge_cache.get(_rank_cache_key(name, ep_idx), {})
+            row = {
+                "姓名":     name,
+                "经历序号":  ep_idx,
+                "供职单位":  d.get("供职单位", ""),
+                "职务":     d.get("职务", ""),
+                "LLM1级别":  d.get("llm1_value", ""),
+                "LLM2级别":  d.get("llm2_value", ""),
+                "level":    d.get("level", ""),
+            }
+            row.update(_decision_view(decision))
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _build_battle4(diff_report: list[dict], judge_cache: dict) -> pd.DataFrame:
+    rows: list[dict] = []
+    for person in diff_report:
+        name = person["official_name"]
+        for d in person.get("diffs", []):
+            field = d.get("field", "")
+            decision = judge_cache.get(_label_cache_key(name, field), {})
+            row = {
+                "姓名":   name,
+                "scope": d.get("scope", ""),
+                "字段":   field,
+                "LLM1值": d.get("llm1_value", ""),
+                "LLM2值": d.get("llm2_value", ""),
+                "LLM1依据": d.get("ds_reason", ""),
+                "LLM2依据": d.get("qw_reason", ""),
+                "level":  d.get("level", ""),
+            }
+            row.update(_decision_view(decision))
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _write_battle(df: pd.DataFrame, path: Path, sheet_name: str = "battle") -> Path:
+    if df.empty:
+        df = pd.DataFrame(columns=["姓名", "字段", "LLM1值", "LLM2值",
+                                    "verdict", "confidence", "reason"])
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name=sheet_name, index=False)
+        ws = writer.sheets[sheet_name]
+        for col_idx in range(1, len(df.columns) + 1):
+            cell = ws.cell(row=1, column=col_idx)
+            cell.fill = FILL_PURPLE
+            cell.font = HEADER_FONT
+        # Highlight low-confidence rows
+        if "confidence" in df.columns:
+            conf_idx = list(df.columns).index("confidence") + 1
+            for r in range(2, len(df) + 2):
+                v = ws.cell(row=r, column=conf_idx).value
+                try:
+                    if v != "" and int(v) < 85:
+                        for c in range(1, len(df.columns) + 1):
+                            ws.cell(row=r, column=c).fill = FILL_RED
+                except (ValueError, TypeError):
+                    pass
+        _auto_width(ws)
+    return path
+
+
+def build_battles(logs_dir: Path, output_dir: Path, province: str) -> dict[str, Path]:
+    """Build battle1.xlsx … battle4.xlsx for the four judge stages."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out: dict[str, Path] = {}
+
+    pairs = [
+        ("battle1", "step1_diff_report.json", "step1_judge_decisions.json", _build_battle1),
+        ("battle2", "step2_diff_report.json", "step2_judge_decisions.json", _build_battle2),
+        ("battle3", "step3_diff_report.json", "step3_judge_decisions.json", _build_battle3),
+        ("battle4", "step4_diff_report.json", "step4_judge_decisions.json", _build_battle4),
+    ]
+    for label, diff_name, judge_name, builder in pairs:
+        diff_path = logs_dir / diff_name
+        judge_path = logs_dir / judge_name
+        if not diff_path.exists():
+            logger.info(f"  跳过 {label}: {diff_name} 不存在")
+            continue
+        try:
+            diff_report = json.loads(diff_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning(f"  {label} 读取 {diff_name} 失败: {e}")
+            continue
+        judge_cache = {}
+        if judge_path.exists():
+            try:
+                judge_cache = json.loads(judge_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        df = builder(diff_report, judge_cache)
+        path = output_dir / f"{province}_{label}.xlsx"
+        _write_battle(df, path, sheet_name=label)
+        out[label] = path
+        logger.info(f"  ✓ {label}: {len(df)} 行 → {path.name}")
+
+    return out

@@ -1,0 +1,36 @@
+# Streamlit 全局配置（本地 & Streamlit Community Cloud 通用）
+
+[client]
+# viewer：隐藏 Deploy、Clear cache 等开发/部署按钮，保留主题(亮/暗)切换
+toolbarMode = "viewer"
+showErrorDetails = false
+
+[browser]
+gatherUsageStats = false
+
+# 视觉风格：宋体 + 绛红强调，简约大气。明暗各一套（app.py 注入 CSS 用半透明灰兜底，自动适配）。
+[theme]
+base = "light"                          # 默认外观；用户可在工具栏切 亮/暗
+primaryColor = "#8c1f28"               # 绛红：primary 按钮 / focus（暗色下在 [theme.dark] 提亮）
+font = "serif"                          # 全站衬线；具体宋体栈由 app.py CSS 指定
+headingFont = "serif"
+codeFont = "monospace"
+baseRadius = "small"                    # 收圆角，方正克制
+showWidgetBorder = false               # 默认不给控件描边，靠留白分隔
+
+# 亮色：白底 + 宣纸暖灰容器
+[theme.light]
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f7f5f1"   # 侧栏/容器：极浅暖灰（宣纸感）
+textColor = "#1f1f1f"                   # 正文：近墨黑
+linkColor = "#8c1f28"
+borderColor = "#e8e3db"                # 边框统一极浅暖灰
+
+# 暗色：暖墨黑底 + 提亮绛红（保持书卷气，不刺眼）
+[theme.dark]
+primaryColor = "#cf5a63"               # 绛红提亮，深底上才看得清
+backgroundColor = "#17150f"            # 暖墨黑（带一点暖，呼应宣纸）
+secondaryBackgroundColor = "#221e17"   # 侧栏/容器：略浅暖墨
+textColor = "#ece7df"                   # 正文：暖白
+linkColor = "#e09aa0"
+borderColor = "#3a342b"

@@ -1,0 +1,63 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Plans (local only — not version-controlled)
+plan/
+
+# Python cache
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Scraped biographies (tracked for reproducibility)
+# officials/
+
+# Output files (generated)
+output/*.xlsx
+output/*.json
+
+# Log/intermediate JSON results (regeneratable)
+logs/*/
+logs/*.json
+logs/*.log
+
+# Temp scratch / backups / dry-run reports
+temp/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.claude/
+
+# Large data files
+data/*.json
+data/*.xlsx
+
+# Slides (local only, not for version control)
+Slides/
+slides/
+
+eval/
+
+
+# Streamlit secrets（真实密钥绝不入库；只提交 .example）
+.streamlit/secrets.toml
+review_app/*.log
+output/cleaned/
+
+# review_app: 部署专用人工清洗站，不进公开基座库
+# （含线上 Supabase 坐标/RLS 拓扑；回合2 Q1=整个不发布）
+review_app/
