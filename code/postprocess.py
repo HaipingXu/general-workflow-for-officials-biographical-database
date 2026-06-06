@@ -24,9 +24,9 @@ from config import (
     DIRECT_MUNICIPALITIES,
     PROVINCE_NAMES,
     POSITION_TAGS,
-    get_highest_rank,
 )
 from text_preprocessor import preprocess_official
+from tenure import source_line_rank_maps
 from utils import normalize_org_name, load_json_cache
 
 logger = logging.getLogger(__name__)
@@ -413,38 +413,11 @@ def flatten_person(
     if rank_map is None:
         rank_map = {}
 
-    # Per source_line: highest concurrent rank (handles split episodes from same line)
-    sl_rank_groups: dict[int, list[str]] = {}
-    for idx_tmp, ep_tmp in enumerate(episodes):
-        sl = ep_tmp.get("source_line", idx_tmp + 1)
-        rank_val = ep_tmp.get("行政级别") or rank_map.get(idx_tmp + 1, "")
-        sl_rank_groups.setdefault(sl, []).append(rank_val)
-    sl_highest_rank: dict[int, str] = {
-        sl: get_highest_rank(ranks) for sl, ranks in sl_rank_groups.items()
-    }
-
-    # Ordered source lines by start time for running cummax computation
-    # (本时期行政级别 = running maximum — only increases, never decreases)
-    _sl_order: list[tuple[int, int, str]] = []  # (sort_key, sl, rank)
-    for idx_tmp, ep_tmp in enumerate(episodes):
-        sl = ep_tmp.get("source_line", idx_tmp + 1)
-        start = ep_tmp.get("起始时间", "") or ""
-        _year = int(start[:4]) if len(start) >= 4 and start[:4].isdigit() else 9999
-        _month = int(start[5:7]) if len(start) >= 7 and start[5:7].isdigit() else 0
-        _sl_order.append((_year * 100 + _month, sl, sl_highest_rank.get(sl, "")))
-    # Deduplicate by sl, keep first occurrence order
-    seen_sl: set[int] = set()
-    _ordered_sl: list[tuple[int, str]] = []
-    for _, sl, rank in sorted(_sl_order):
-        if sl not in seen_sl:
-            seen_sl.add(sl)
-            _ordered_sl.append((sl, rank))
-    # Build per-sl running cummax
-    sl_cummax: dict[int, str] = {}
-    _best_so_far: str = ""
-    for sl, rank in _ordered_sl:
-        _best_so_far = get_highest_rank([_best_so_far, rank]) if _best_so_far else rank
-        sl_cummax[sl] = _best_so_far
+    # Per source_line grouping + running cummax (本时期行政级别), extracted to
+    # tenure.py so derive_labels reuses the exact same 兼职 就高不就低 grouping.
+    #   sl_highest_rank[sl] = 组内最高级别（同期兼职就高不就低）
+    #   sl_cummax[sl]       = 截至该 source_line 的 running max（本时期行政级别，不降）
+    sl_highest_rank, sl_cummax = source_line_rank_maps(episodes, rank_map)
 
     # judge4 confidence goes to first row only
     judge4_first_row = judge_buckets.get("judge4_person", "")
