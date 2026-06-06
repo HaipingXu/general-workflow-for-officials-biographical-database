@@ -144,7 +144,7 @@ COLUMNS = [
     "judge2con",
     # --- Step3 field + judge3con ---
     "该条行政级别",
-    "最终行政级别",   # running cummax: highest rank up to and including this episode
+    "本时期行政级别",   # running cummax: highest rank up to and including this episode
     "judge3con",
     # --- 引用 ---
     "原文引用",

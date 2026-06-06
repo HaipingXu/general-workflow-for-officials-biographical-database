@@ -38,7 +38,7 @@ Two independent LLMs extract career episodes in parallel. A third reasoning mode
 
 ## Output Schema (30 Columns)
 
-**Person-level** (A–N): 年份, 省份, 姓名, 出生年份, 籍贯, 籍贯（市）, 少数民族, 女性, 全日制本科, 升迁\_省长, 升迁\_省委书记, 本省提拔, 本省学习, 最终行政级别
+**Person-level** (A–N): 年份, 省份, 姓名, 出生年份, 籍贯, 籍贯（市）, 少数民族, 女性, 全日制本科, 升迁\_省长, 升迁\_省委书记, 本省提拔, 本省学习, 本时期行政级别
 
 **Episode-level** (O–AD): 经历序号, 起始时间, 终止时间, 组织标签, 标志位, 该条行政级别, 供职单位, 职务, 原文引用, 争议未解决, 任职地（省）, 任职地（市）, 中央/地方, 是否落马, 落马原因, 备注栏
 
