@@ -55,9 +55,12 @@ eval/
 
 # Streamlit secrets（真实密钥绝不入库；只提交 .example）
 .streamlit/secrets.toml
-review_app/*.log
 output/cleaned/
 
-# review_app: 部署专用人工清洗站，不进公开基座库
-# （含线上 Supabase 坐标/RLS 拓扑；回合2 Q1=整个不发布）
-review_app/
+# review_app: 代码与通用文档已发布；以下为本地/部署专属，绝不入库
+# （.gitignore 不支持行尾注释，注释须独立成行）
+review_app/*.log
+# 本地 CSV 回退后端的落盘
+review_app/edits/
+# 内部运维交接（线上 Supabase 坐标/账号/踩坑），含敏感信息，不发布
+review_app/DEPLOYMENT_INFO.md
