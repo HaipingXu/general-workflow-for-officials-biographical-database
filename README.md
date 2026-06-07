@@ -36,11 +36,11 @@ Phase 6  导出 + battle → output/{范围}/{范围}_officials.xlsx
 
 ### 模型与并发
 
-| 角色 | 模型 | 来源 |
+| 角色 | 模型 | 
 |------|------|------|
-| LLM1（提取） | `deepseek-v4-flash` | DeepSeek |
-| LLM2（验证） | `claude-opus-4-7` | BLTCY |
-| Judge（裁判） | `gpt-5.5` | BLTCY |
+| LLM1（提取） | `deepseek-v4-flash` |
+| LLM2（验证） | `claude-opus-4-7` |
+| Judge（裁判） | `gpt-5.5` |
 
 API key 支持逗号分隔多 key 轮询；裁判信心阈值、并发上限（`LLM1/LLM2/JUDGE_MAX_WORKERS`）见 `code/config.py`。
 
@@ -144,4 +144,4 @@ cd code && uv run python -m pytest tests/ -q
 
 ## 可选：人工清洗网站
 
-项目另有一个 Streamlit + Supabase 的人工核查界面，只对机器**有分歧且裁判没把握**（信心 < 85）的条目排队，改动写成「提案」不覆盖原始数据。该网站含部署密钥，**不随本仓库公开发布**（已在 `.gitignore` 中排除）。
+项目另有一个 Streamlit + Supabase 的人工核查界面，只对机器**有分歧且裁判没把握**（信心 < 85）的条目排队，改动写成「提案」不覆盖原始数据。
